@@ -46,13 +46,25 @@ impl CurrentSafeZone {
         self.as_ref().is_some_and(|sz| sz.id == other.id)
     }
 
+    pub fn should_update_target(&self, other: &SafeZone) -> bool {
+        let Some(current) = self.as_ref() else {
+            return true;
+        };
+
+        // Resend an unchanged target when it belongs to a new plan.
+        if current.id.plan_id != other.id.plan_id {
+            return true;
+        }
+
+        self.distancesq_to_target(other) >= 0.5
+    }
+
     pub fn distancesq_to_target(&self, other: &SafeZone) -> f64 {
-        let Some(safe_zone) = self.0.clone() else {
-            // TODO(arjoc): Clean up lifetimes
+        let Some(safe_zone) = self.as_ref() else {
             return f64::INFINITY;
         };
 
-        let Some((sx, sy)) = Self::get_point(&safe_zone) else {
+        let Some((sx, sy)) = Self::get_point(safe_zone) else {
             return f64::INFINITY;
         };
 
@@ -221,7 +233,7 @@ fn update_incremental_target(
             continue;
         };
 
-        if current_safe_zone.distancesq_to_target(&safe_zone) < 0.5 {
+        if !current_safe_zone.should_update_target(&safe_zone) {
             continue;
         }
         debug!(
@@ -306,4 +318,69 @@ fn next_target(safe_zone: &SafeZone) -> Option<(f32, f32, f32)> {
     }
 
     xy.zip(yaw).map(|((x, y), yaw)| (x, y, yaw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ros_env::rmf_prototype_msgs::msg::TargetRegion;
+
+    fn safe_zone(
+        session: u8,
+        plan_version: u64,
+        safe_zone_version: u64,
+        x: f32,
+        y: f32,
+    ) -> SafeZone {
+        let mut safe_zone = SafeZone::default();
+        safe_zone.id.plan_id.destination_session.uuid[0] = session;
+        safe_zone.id.plan_id.plan_version = plan_version;
+        safe_zone.id.safe_zone_version = safe_zone_version;
+
+        let mut target = TargetRegion::default();
+        target.region.hint = Region::HINT_POINT;
+        target.region.points = vec![x, y];
+        safe_zone.incremental_target.regions.push(target);
+        safe_zone
+    }
+
+    #[test]
+    fn first_target_is_sent() {
+        let current = CurrentSafeZone::default();
+        let next = safe_zone(1, 0, 0, 4.0, 4.0);
+
+        assert!(current.should_update_target(&next));
+    }
+
+    #[test]
+    fn nearby_target_from_same_plan_is_suppressed() {
+        let current = CurrentSafeZone(Some(safe_zone(1, 3, 7, 4.0, 4.0)));
+        let next = safe_zone(1, 3, 8, 4.25, 4.0);
+
+        assert!(!current.should_update_target(&next));
+    }
+
+    #[test]
+    fn moved_target_from_same_plan_is_sent() {
+        let current = CurrentSafeZone(Some(safe_zone(1, 3, 7, 4.0, 4.0)));
+        let next = safe_zone(1, 3, 8, 5.0, 4.0);
+
+        assert!(current.should_update_target(&next));
+    }
+
+    #[test]
+    fn same_target_from_new_plan_is_sent() {
+        let current = CurrentSafeZone(Some(safe_zone(1, 3, 7, 4.0, 4.0)));
+        let next = safe_zone(1, 4, 0, 4.0, 4.0);
+
+        assert!(current.should_update_target(&next));
+    }
+
+    #[test]
+    fn same_target_from_new_destination_session_is_sent() {
+        let current = CurrentSafeZone(Some(safe_zone(1, 3, 7, 4.0, 4.0)));
+        let next = safe_zone(2, 3, 0, 4.0, 4.0);
+
+        assert!(current.should_update_target(&next));
+    }
 }
