@@ -107,6 +107,31 @@ pub struct PlanExecutor {
     pub latest_map: Option<OccupancyGrid>,
 }
 
+fn target_yaw(plan: &Plan, target_idx: usize) -> f32 {
+    let Some(target) = plan.waypoints.get(target_idx) else {
+        return 0.0;
+    };
+    let [target_x, target_y] = target.position;
+
+    for waypoint in plan.waypoints[..target_idx].iter().rev() {
+        let dx = target_x - waypoint.position[0];
+        let dy = target_y - waypoint.position[1];
+        if dx.hypot(dy) > 1e-3 {
+            return dy.atan2(dx);
+        }
+    }
+
+    for waypoint in plan.waypoints.iter().skip(target_idx + 1) {
+        let dx = waypoint.position[0] - target_x;
+        let dy = waypoint.position[1] - target_y;
+        if dx.hypot(dy) > 1e-3 {
+            return dy.atan2(dx);
+        }
+    }
+
+    0.0
+}
+
 impl PlanExecutor {
     pub fn new(node: Node) -> Self {
         let mut origin = Pose::default();
@@ -479,6 +504,7 @@ impl PlanExecutor {
 
         let target_x = plan.waypoints[released_wp_idx].position[0];
         let target_y = plan.waypoints[released_wp_idx].position[1];
+        let target_yaw = target_yaw(plan, released_wp_idx);
 
         let costmap = Self::to_costmap_msg(
             &positions,
@@ -500,16 +526,17 @@ impl PlanExecutor {
         let safe_zone = SafeZone {
             incremental_target: DestinationConstraints {
                 regions: vec![rmf_prototype_msgs::msg::TargetRegion {
-                    tolerance: 0.2,
+                    tolerance: 0.1,
                     region: rmf_prototype_msgs::msg::Region {
                         points: vec![target_x, target_y],
                         hint: rmf_prototype_msgs::msg::Region::HINT_POINT,
                     },
                     orientations: vec![TargetOrientation {
-                        orientation_radians: 0.0, // TODO(@xiyuoh)
+                        // Avoid turning in place at hold points.
+                        orientation_radians: target_yaw,
                         spread_radians: 0.0,
                         tolerance_radians: 0.0,
-                    }], // TODO(@xiyuoh) calculate actual orientation
+                    }],
                 }],
                 nodes: vec![],
             },
@@ -740,11 +767,50 @@ fn distance_squared_to_segment(point: (f32, f32), start: (f32, f32), end: (f32, 
 
 #[cfg(test)]
 mod tests {
-    use super::{route_intersects_map, BlockageMonitor, BLOCKAGE_DEBOUNCE, REPLAN_COOLDOWN};
+    use super::{
+        route_intersects_map, target_yaw, BlockageMonitor, BLOCKAGE_DEBOUNCE, REPLAN_COOLDOWN,
+    };
     use mapf_post::na::{Isometry2, Vector2};
     use mapf_post::{Trajectory, WaypointFollower};
-    use ros_env::{nav_msgs::msg::OccupancyGrid, rmf_prototype_msgs::msg::PlanId};
+    use ros_env::{
+        nav_msgs::msg::OccupancyGrid,
+        rmf_prototype_msgs::msg::{Plan, PlanId, Waypoint},
+    };
     use std::time::Instant;
+
+    fn plan_with_positions(positions: &[[f32; 2]]) -> Plan {
+        Plan {
+            waypoints: positions
+                .iter()
+                .map(|position| Waypoint {
+                    position: *position,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn target_yaw_ignores_stationary_wait_waypoints() {
+        let plan = plan_with_positions(&[[3.0, 4.0], [3.0, 4.0], [3.0, 4.0], [3.0, 5.0]]);
+
+        assert!((target_yaw(&plan, 3) - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn target_yaw_uses_departure_direction_at_trajectory_start() {
+        let plan = plan_with_positions(&[[3.0, 4.0], [3.0, 4.0], [2.0, 4.0]]);
+
+        assert!((target_yaw(&plan, 0) - std::f32::consts::PI).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stationary_trajectory_has_neutral_yaw() {
+        let plan = plan_with_positions(&[[3.0, 4.0], [3.0, 4.0]]);
+
+        assert_eq!(target_yaw(&plan, 1), 0.0);
+    }
 
     #[test]
     fn occupied_cell_on_remaining_route_is_blocked() {
