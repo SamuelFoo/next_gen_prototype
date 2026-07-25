@@ -1,6 +1,6 @@
 # Layered Map Server Demos
 
-This package contains two demonstrations of the layered map server.
+This package contains three demonstrations of the layered map server.
 
 ## TTL Smoke Test
 
@@ -44,6 +44,8 @@ ros2 launch rmf_layered_map_server_demo replan_obstacle.launch.py
 
 Two robots start with non-overlapping scan regions and separate goals. Once their initial plans are active, the demo spawns a red bar across both scan regions. The bar meets the right wall to form a dead end and leaves a detour around its left end.
 
+The global RViz view shows robot-colored poses, goals, region contributions, and Nav2 paths alongside the green RMF plans.
+
 Use the warehouse scenario to reproduce the original two-aisle case:
 
 ```bash
@@ -59,10 +61,10 @@ The expected sequence in the global RViz window is:
 
 1. Both initial plans appear on the static map.
 2. The long bar is spawned and its detected portions enter the combined `/map`.
-3. The plan executor detects the blocked route and publishes `PlanError.CODE_PATH_BLOCKED`.
+3. After a 300 ms debounce, the plan executor publishes `PlanError.CODE_PATH_BLOCKED` for the blocked route.
 4. The path server publishes a new plan using the updated map.
 
-The path server conservatively downsamples the `0.1 m` simple-room map and the `0.03 m` warehouse map to its `1.0 m` PiBT planning resolution. Any planning cell containing an occupied source cell remains occupied.
+The path server conservatively downsamples the `0.1 m` simple-room map and the `0.03 m` warehouse map to its `1.0 m` PiBT planning resolution. Any planning cell containing an occupied source cell remains occupied. Replan reports have a two-second cooldown to prevent oscillation.
 
 Useful launch arguments:
 
