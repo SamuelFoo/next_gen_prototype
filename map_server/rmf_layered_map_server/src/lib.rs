@@ -19,26 +19,31 @@ use ros_env::{
     rmf_layered_map_msgs::msg::{MapRegionPatch, MapRegionUpdate},
     rmf_prototype_msgs::msg::Region,
 };
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
 const MAP_QOS_DEPTH: u32 = 10;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum DynamicUpdateType {
     Obstacle,
     Clear,
 }
 
-#[derive(Clone, Debug)]
-struct DynamicObservation {
-    source_id: String,
-    map_name: String,
-    frame_id: String,
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct DynamicCellKey {
     update_type: DynamicUpdateType,
+    cell_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct DynamicCell {
     occupancy_value: i8,
-    regions: Vec<Region>,
     expires_at_nsec: i128,
+    sequence: u64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -50,9 +55,10 @@ struct ObservationSourceKey {
 #[derive(Clone, Debug)]
 pub struct LayeredMap {
     static_grid: Option<OccupancyGrid>,
-    dynamic_observations: Vec<DynamicObservation>,
+    dynamic_cells: HashMap<ObservationSourceKey, HashMap<DynamicCellKey, Vec<DynamicCell>>>,
     latest_source_stamps: HashMap<ObservationSourceKey, i128>,
     default_ttl_nsec: i128,
+    next_sequence: u64,
     revision: u64,
 }
 
@@ -60,9 +66,10 @@ impl LayeredMap {
     pub fn new(default_ttl: Duration) -> Self {
         Self {
             static_grid: None,
-            dynamic_observations: Vec::new(),
+            dynamic_cells: HashMap::new(),
             latest_source_stamps: HashMap::new(),
             default_ttl_nsec: duration_to_nsec(default_ttl),
+            next_sequence: 0,
             revision: 0,
         }
     }
@@ -72,11 +79,18 @@ impl LayeredMap {
     }
 
     pub fn dynamic_observation_count(&self) -> usize {
-        self.dynamic_observations.len()
+        self.dynamic_cells.values().map(HashMap::len).sum()
     }
 
     pub fn set_static_map(&mut self, mut grid: OccupancyGrid) {
         normalize_grid_data(&mut grid);
+        if self
+            .static_grid
+            .as_ref()
+            .is_some_and(|current| !same_grid_geometry(current, &grid))
+        {
+            self.dynamic_cells.clear();
+        }
         self.static_grid = Some(grid);
         self.revision = self.revision.wrapping_add(1);
     }
@@ -85,6 +99,9 @@ impl LayeredMap {
         if source_validation_error(&update, self.static_frame_id()).is_some() {
             return false;
         }
+        let Some(static_grid) = self.static_grid.as_ref() else {
+            return false;
+        };
 
         let reset_source = update.reset_source;
         let key = ObservationSourceKey {
@@ -105,14 +122,10 @@ impl LayeredMap {
         let mut changed = false;
 
         if reset_source {
-            let before = self.dynamic_observations.len();
-            self.dynamic_observations
-                .retain(|obs| obs.source_id != key.source_id || obs.map_name != key.map_name);
-            changed |= before != self.dynamic_observations.len();
+            changed |= self.dynamic_cells.remove(&key).is_some();
         }
 
         let default_ttl_sec = update.source.default_ttl_sec;
-        let frame_id = update.source.header.frame_id;
         let robot_pose = update.source.robot_pose;
         let mut patches = update.patches;
         patches.sort_by_key(|patch| match patch.update_type {
@@ -127,16 +140,6 @@ impl LayeredMap {
                 MapRegionPatch::UPDATE_CLEAR => DynamicUpdateType::Clear,
                 _ => continue,
             };
-
-            let regions: Vec<_> = patch
-                .regions
-                .into_iter()
-                .filter(|region| region_validation_error(region).is_none())
-                .map(|region| transform_region(region, &robot_pose))
-                .collect();
-            if regions.is_empty() {
-                continue;
-            }
 
             let ttl_nsec = positive_seconds_to_nsec(patch.ttl_sec)
                 .or_else(|| positive_seconds_to_nsec(default_ttl_sec))
@@ -157,15 +160,35 @@ impl LayeredMap {
                 DynamicUpdateType::Clear => patch.occupancy_value.clamp(0, 100),
             };
 
-            self.dynamic_observations.push(DynamicObservation {
-                source_id: key.source_id.clone(),
-                map_name: key.map_name.clone(),
-                frame_id: frame_id.clone(),
-                update_type,
-                occupancy_value,
-                regions,
-                expires_at_nsec,
-            });
+            let cell_indices = patch
+                .regions
+                .into_iter()
+                .filter(|region| region_validation_error(region).is_none())
+                .map(|region| transform_region(region, &robot_pose))
+                .flat_map(|region| rasterized_indices(static_grid, &region))
+                .collect::<HashSet<_>>();
+            if cell_indices.is_empty() {
+                continue;
+            }
+
+            let sequence = self.next_sequence;
+            self.next_sequence = self.next_sequence.wrapping_add(1);
+            let source_cells = self.dynamic_cells.entry(key.clone()).or_default();
+            for cell_index in cell_indices {
+                let history = source_cells
+                    .entry(DynamicCellKey {
+                        update_type,
+                        cell_index,
+                    })
+                    .or_default();
+                // Keep older entries only when they may outlive the new one.
+                history.retain(|cell| cell.expires_at_nsec > expires_at_nsec);
+                history.push(DynamicCell {
+                    occupancy_value,
+                    expires_at_nsec,
+                    sequence,
+                });
+            }
             changed = true;
         }
 
@@ -180,10 +203,18 @@ impl LayeredMap {
     }
 
     pub fn prune_expired(&mut self, now_nsec: i128) -> bool {
-        let before = self.dynamic_observations.len();
-        self.dynamic_observations
-            .retain(|obs| obs.expires_at_nsec > now_nsec);
-        let changed = before != self.dynamic_observations.len();
+        let mut changed = false;
+        self.dynamic_cells.retain(|_, cells| {
+            cells.retain(|_, history| {
+                history.retain(|cell| {
+                    let active = cell.expires_at_nsec > now_nsec;
+                    changed |= !active;
+                    active
+                });
+                !history.is_empty()
+            });
+            !cells.is_empty()
+        });
         if changed {
             self.revision = self.revision.wrapping_add(1);
         }
@@ -193,20 +224,26 @@ impl LayeredMap {
     pub fn compose(&self) -> Option<OccupancyGrid> {
         let mut composed = self.static_grid.clone()?;
         normalize_grid_data(&mut composed);
-        let frame_id = composed.header.frame_id.clone();
 
-        for observation in self
-            .dynamic_observations
-            .iter()
-            .filter(|obs| obs.frame_id == frame_id && obs.update_type == DynamicUpdateType::Clear)
-        {
-            rasterize_observation(&mut composed, observation);
-        }
+        for update_type in [DynamicUpdateType::Clear, DynamicUpdateType::Obstacle] {
+            let mut cells = self
+                .dynamic_cells
+                .values()
+                .flat_map(|source_cells| source_cells.iter())
+                .filter_map(|(key, history)| {
+                    if key.update_type != update_type {
+                        return None;
+                    }
+                    history.last().map(|cell| (key, cell))
+                })
+                .collect::<Vec<_>>();
+            cells.sort_by_key(|(_, cell)| cell.sequence);
 
-        for observation in self.dynamic_observations.iter().filter(|obs| {
-            obs.frame_id == frame_id && obs.update_type == DynamicUpdateType::Obstacle
-        }) {
-            rasterize_observation(&mut composed, observation);
+            for (key, cell) in cells {
+                if let Some(value) = composed.data.get_mut(key.cell_index) {
+                    *value = cell.occupancy_value;
+                }
+            }
         }
 
         Some(composed)
@@ -285,7 +322,7 @@ impl LayeredMapServer {
         if self.map.ingest_region_update(msg, now_nsec) {
             rclrs::log!(
                 self.node.logger(),
-                "Accepted region update, revision {}, active observations {}",
+                "Accepted region update, revision {}, active rasterized cells {}",
                 self.map.revision(),
                 self.map.dynamic_observation_count()
             );
@@ -298,7 +335,7 @@ impl LayeredMapServer {
         if self.map.prune_expired(now_nsec) {
             rclrs::log!(
                 self.node.logger(),
-                "Pruned expired observations, revision {}, active observations {}",
+                "Pruned expired observations, revision {}, active rasterized cells {}",
                 self.map.revision(),
                 self.map.dynamic_observation_count()
             );
@@ -569,14 +606,12 @@ fn grid_len(grid: &OccupancyGrid) -> Option<usize> {
     width.checked_mul(height)
 }
 
-fn rasterize_observation(grid: &mut OccupancyGrid, observation: &DynamicObservation) {
-    for region in &observation.regions {
-        for index in rasterized_indices(grid, region) {
-            if let Some(cell) = grid.data.get_mut(index) {
-                *cell = observation.occupancy_value;
-            }
-        }
-    }
+fn same_grid_geometry(lhs: &OccupancyGrid, rhs: &OccupancyGrid) -> bool {
+    lhs.header.frame_id == rhs.header.frame_id
+        && lhs.info.width == rhs.info.width
+        && lhs.info.height == rhs.info.height
+        && lhs.info.resolution == rhs.info.resolution
+        && lhs.info.origin == rhs.info.origin
 }
 
 fn rasterized_indices(grid: &OccupancyGrid, region: &Region) -> Vec<usize> {
@@ -949,13 +984,14 @@ mod tests {
         let mut map = LayeredMap::default();
         map.set_static_map(static_grid(3, 3, 0));
 
-        assert!(map.ingest_region_update(
+        assert!(!map.ingest_region_update(
             update(
                 MapRegionPatch::UPDATE_OBSTACLE,
                 vec![rectangle(10.0, 10.0, 11.0, 11.0)]
             ),
             0,
         ));
+        assert_eq!(map.dynamic_observation_count(), 0);
 
         let composed = map.compose().unwrap();
         assert!(composed.data.iter().all(|cell| *cell == 0));
@@ -1166,5 +1202,121 @@ mod tests {
         assert_eq!(map.dynamic_observation_count(), 1);
         assert_eq!(composed.data[1 * 5 + 1], 0);
         assert_eq!(composed.data[3 * 5 + 3], 100);
+    }
+
+    #[test]
+    fn repeated_regions_refresh_rasterized_cells_without_stacking() {
+        let mut map = LayeredMap::default();
+        map.set_static_map(static_grid(3, 3, 0));
+
+        let mut first = update(MapRegionPatch::UPDATE_OBSTACLE, vec![point(1.0, 1.0)]);
+        first.patches[0].occupancy_value = 40;
+        first.patches[0].ttl_sec = 1.0;
+        assert!(map.ingest_region_update(first, 0));
+        assert_eq!(map.dynamic_observation_count(), 1);
+
+        let mut refreshed = update(MapRegionPatch::UPDATE_OBSTACLE, vec![point(1.0, 1.0)]);
+        refreshed.source.header.stamp.sec = 2;
+        refreshed.patches[0].occupancy_value = 80;
+        refreshed.patches[0].ttl_sec = 10.0;
+        assert!(map.ingest_region_update(refreshed, 0));
+        assert_eq!(map.dynamic_observation_count(), 1);
+        assert!(!map.prune_expired(3 * NANOS_PER_SECOND));
+
+        let composed = map.compose().unwrap();
+        assert_eq!(composed.data[1 * 3 + 1], 80);
+
+        assert!(map.prune_expired(13 * NANOS_PER_SECOND));
+        assert_eq!(map.dynamic_observation_count(), 0);
+    }
+
+    #[test]
+    fn longer_lived_cell_evidence_resurfaces_after_newer_evidence_expires() {
+        let mut map = LayeredMap::default();
+        map.set_static_map(static_grid(3, 3, 0));
+
+        let mut first = update(MapRegionPatch::UPDATE_OBSTACLE, vec![point(1.0, 1.0)]);
+        first.patches[0].occupancy_value = 40;
+        first.patches[0].ttl_sec = 10.0;
+        assert!(map.ingest_region_update(first, 0));
+
+        let mut newer = update(MapRegionPatch::UPDATE_OBSTACLE, vec![point(1.0, 1.0)]);
+        newer.source.header.stamp.sec = 2;
+        newer.patches[0].occupancy_value = 80;
+        newer.patches[0].ttl_sec = 1.0;
+        assert!(map.ingest_region_update(newer, 0));
+        assert_eq!(map.dynamic_observation_count(), 1);
+        assert_eq!(map.compose().unwrap().data[1 * 3 + 1], 80);
+
+        assert!(map.prune_expired(4 * NANOS_PER_SECOND));
+        assert_eq!(map.dynamic_observation_count(), 1);
+        assert_eq!(map.compose().unwrap().data[1 * 3 + 1], 40);
+
+        assert!(map.prune_expired(12 * NANOS_PER_SECOND));
+        assert_eq!(map.dynamic_observation_count(), 0);
+    }
+
+    #[test]
+    fn most_recent_source_wins_between_same_type_cell_contributions() {
+        let mut map = LayeredMap::default();
+        map.set_static_map(static_grid(3, 3, 0));
+
+        let mut first = update_from(
+            "robot_1/local_costmap",
+            MapRegionPatch::UPDATE_OBSTACLE,
+            vec![point(1.0, 1.0)],
+        );
+        first.patches[0].occupancy_value = 40;
+        assert!(map.ingest_region_update(first, 0));
+
+        let mut second = update_from(
+            "robot_2/local_costmap",
+            MapRegionPatch::UPDATE_OBSTACLE,
+            vec![point(1.0, 1.0)],
+        );
+        second.patches[0].occupancy_value = 80;
+        second.patches[0].ttl_sec = 1.0;
+        assert!(map.ingest_region_update(second, 0));
+        assert_eq!(map.dynamic_observation_count(), 2);
+
+        let composed = map.compose().unwrap();
+        assert_eq!(composed.data[1 * 3 + 1], 80);
+
+        assert!(map.prune_expired(3 * NANOS_PER_SECOND));
+        let composed = map.compose().unwrap();
+        assert_eq!(composed.data[1 * 3 + 1], 40);
+    }
+
+    #[test]
+    fn static_map_updates_preserve_cells_only_when_geometry_matches() {
+        let mut map = LayeredMap::default();
+        map.set_static_map(static_grid(3, 3, 0));
+        assert!(map.ingest_region_update(
+            update(MapRegionPatch::UPDATE_OBSTACLE, vec![point(1.0, 1.0)]),
+            0,
+        ));
+
+        map.set_static_map(static_grid(3, 3, -1));
+
+        assert_eq!(map.dynamic_observation_count(), 1);
+        let composed = map.compose().unwrap();
+        assert_eq!(composed.data[1 * 3 + 1], 100);
+        assert_eq!(composed.data[0], -1);
+
+        map.set_static_map(static_grid(4, 4, 0));
+
+        assert_eq!(map.dynamic_observation_count(), 0);
+        assert!(map.compose().unwrap().data.iter().all(|cell| *cell == 0));
+    }
+
+    #[test]
+    fn updates_are_rejected_until_a_static_grid_can_rasterize_them() {
+        let mut map = LayeredMap::default();
+
+        assert!(!map.ingest_region_update(
+            update(MapRegionPatch::UPDATE_OBSTACLE, vec![point(1.0, 1.0)]),
+            0,
+        ));
+        assert_eq!(map.dynamic_observation_count(), 0);
     }
 }
