@@ -20,12 +20,13 @@ use ros_env::{
     rmf_prototype_msgs::msg::Region,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     time::Duration,
 };
 
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
 const MAP_QOS_DEPTH: u32 = 10;
+const MAX_PENDING_REGION_UPDATES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum DynamicUpdateType {
@@ -283,9 +284,23 @@ impl Default for LayeredMapServerConfig {
     }
 }
 
+fn push_pending_region_update(
+    updates: &mut VecDeque<MapRegionUpdate>,
+    update: MapRegionUpdate,
+) -> Option<MapRegionUpdate> {
+    let dropped = if updates.len() >= MAX_PENDING_REGION_UPDATES {
+        updates.pop_front()
+    } else {
+        None
+    };
+    updates.push_back(update);
+    dropped
+}
+
 pub struct LayeredMapServer {
     node: Node,
     map: LayeredMap,
+    pending_region_updates: VecDeque<MapRegionUpdate>,
     map_publisher: rclrs::Publisher<OccupancyGrid>,
     last_published_revision: Option<u64>,
 }
@@ -301,6 +316,7 @@ impl LayeredMapServer {
         Ok(Self {
             node,
             map: LayeredMap::new(config.default_ttl),
+            pending_region_updates: VecDeque::new(),
             map_publisher,
             last_published_revision: None,
         })
@@ -308,6 +324,25 @@ impl LayeredMapServer {
 
     fn handle_static_map(&mut self, msg: OccupancyGrid) {
         self.map.set_static_map(msg);
+        let pending_updates = std::mem::take(&mut self.pending_region_updates);
+        let pending_count = pending_updates.len();
+        if pending_count > 0 {
+            let now_nsec = self.now_nsec();
+            let mut changed_count = 0;
+            for update in pending_updates {
+                log_region_update_errors(&self.node, &update, self.map.static_frame_id());
+                if self.map.ingest_region_update(update, now_nsec) {
+                    changed_count += 1;
+                }
+            }
+            rclrs::log!(
+                self.node.logger(),
+                "Rasterized {} queued region updates; {} changed the map",
+                pending_count,
+                changed_count
+            );
+        }
+
         rclrs::log!(
             self.node.logger(),
             "Received static map, revision {}",
@@ -317,6 +352,30 @@ impl LayeredMapServer {
     }
 
     fn handle_region_update(&mut self, msg: MapRegionUpdate) {
+        if self.map.static_grid.is_none() {
+            log_region_update_errors(&self.node, &msg, None);
+            if source_validation_error(&msg, None).is_some() {
+                return;
+            }
+
+            let source_id = msg.source.source_id.clone();
+            if let Some(dropped) = push_pending_region_update(&mut self.pending_region_updates, msg)
+            {
+                rclrs::log_warn!(
+                    self.node.logger(),
+                    "Region update queue is full; dropped oldest update from '{}'",
+                    dropped.source.source_id
+                );
+            }
+            rclrs::log!(
+                self.node.logger(),
+                "Queued region update from '{}' until a static map is available ({} queued)",
+                source_id,
+                self.pending_region_updates.len()
+            );
+            return;
+        }
+
         log_region_update_errors(&self.node, &msg, self.map.static_frame_id());
         let now_nsec = self.now_nsec();
         if self.map.ingest_region_update(msg, now_nsec) {
@@ -1318,5 +1377,28 @@ mod tests {
             0,
         ));
         assert_eq!(map.dynamic_observation_count(), 0);
+    }
+
+    #[test]
+    fn pending_region_update_queue_is_bounded_and_fifo() {
+        let mut pending = VecDeque::new();
+
+        for index in 0..=MAX_PENDING_REGION_UPDATES {
+            let mut update = update(MapRegionPatch::UPDATE_OBSTACLE, vec![point(1.0, 1.0)]);
+            update.source.source_id = format!("source_{index}");
+            let dropped = push_pending_region_update(&mut pending, update);
+            if index < MAX_PENDING_REGION_UPDATES {
+                assert!(dropped.is_none());
+            } else {
+                assert_eq!(dropped.unwrap().source.source_id, "source_0");
+            }
+        }
+
+        assert_eq!(pending.len(), MAX_PENDING_REGION_UPDATES);
+        assert_eq!(pending.front().unwrap().source.source_id, "source_1");
+        assert_eq!(
+            pending.back().unwrap().source.source_id,
+            format!("source_{MAX_PENDING_REGION_UPDATES}")
+        );
     }
 }
